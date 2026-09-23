@@ -1,0 +1,4 @@
+Manifest.toml
+examples/Manifest.toml
+examples/_output/
+examples/.quarto/

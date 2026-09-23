@@ -1,0 +1,291 @@
+---
+title: "PRINCE: clinical and immune correlates with patternq"
+subtitle: "prince-2022 on the Pattern Data Commons · Julia"
+engine: julia
+julia:
+  exeflags: ["--project=@."]
+---
+
+```{julia}
+#| include: false
+using PatternQ, DataFrames, Statistics
+```
+
+This notebook re-creates, on the Pattern Data Commons copy of the PRINCE trial,
+the kinds of analyses in Padron et al., *Nat Med* 2022 (PRINCE: sotigalimab
+and/or nivolumab with gemcitabine/nab-paclitaxel in first-line metastatic
+pancreatic cancer): overall survival, circulating immune populations over
+treatment, survival stratified at the median of a baseline biomarker, marker
+expression on those populations, serum proteins, and tumor gene expression
+signatures.
+
+It is a demonstration of the `patternq` workflow, not a re-analysis.
+
+> **Treatment arm is not in the `prince-2022` database.** The paper stratifies
+> most analyses by arm (nivo/chemo, sotiga/chemo, sotiga/nivo/chemo). Arm is in
+> the source data (`PICI0002_ph2_clinical.csv`, `Arm` / `Actual Arm`) but was
+> not imported, so here every analysis pools patients across arms and groups
+> by survival status at 1 year. P-values are unadjusted and exploratory.
+
+The same notebook exists in R (knitr), Python (marimo) and Clojure (Clay) in
+`prince_demo.qmd` in [patternq-r](https://github.com/RCRF/patternq-r), `prince_demo.qmd` in [patternq](https://github.com/RCRF/patternq) and
+`prince_demo.clj` in [patternq-clj](https://github.com/RCRF/patternq-clj).
+
+## The dataset
+
+Every dataset is its own database. `resolve_db` maps the stable dataset name
+to the current database.
+
+```{julia}
+db = resolve_db("prince-2022")
+set_db(db)
+println(db)
+dataset_summary()
+```
+
+Which subjects were profiled by which assays:
+
+```{julia}
+sa = sample_assays()
+plot_sample_overview(sa)
+```
+
+Samples by timepoint and specimen (blood draws at C1D1, C1D15, C2D1, C4D1;
+tumor biopsies at screening):
+
+```{julia}
+smp = samples()
+ct = combine(groupby(dropmissing(smp, :sample_specimen), [:timepoint_id, :sample_specimen]), nrow => :n)
+sort(unstack(ct, :timepoint_id, :sample_specimen, :n; fill=0), :timepoint_id)
+```
+
+## Outcomes
+
+Best overall response, progression-free and overall survival (months) per
+subject, and survival status at 1 year (the paper's primary endpoint is 1-year
+OS). Subjects censored before 1 year have unknown status.
+
+```{julia}
+outcomes = subject_outcomes()
+outcomes.status_1y = survival_status(outcomes; time="os", event="os_event", at=12)
+status_levels = ["alive at 1 year", "died within 1 year"]
+display(combine(groupby(outcomes, :status_1y), nrow => :n))
+combine(groupby(outcomes, :bor), nrow => :n)
+```
+
+Overall survival (Fig. 2a pools arms here) and by best overall response:
+
+```{julia}
+plot_survival(outcomes; title="Overall survival", xlab="months")
+```
+
+```{julia}
+plot_survival(outcomes; group="bor", title="Overall survival by best overall response", xlab="months")
+```
+
+Progression-free survival (Extended Data Fig. 2a):
+
+```{julia}
+plot_survival(outcomes; time="pfs", event="pfs_event", title="Progression-free survival", xlab="months")
+```
+
+## Circulating immune populations
+
+Frequencies of gated populations from the X50 (flow) and CyTOF panels, with
+sample context (subject, timepoint) and 1-year survival status joined on.
+
+```{julia}
+with_status(tab) = (ctx = add_sample_context(tab; include_subjects=false);
+                    keep_provenance(innerjoin(ctx, select(outcomes, :subject_id, :status_1y); on=:subject_id), ctx))
+x50 = with_status(measurements("percent-of-parent", "PICI X50 Immune Profiling"))
+cytof = with_status(vcat(measurements("percent-of-parent", "PICI CyTOF Immune Profiling"),
+                         measurements("percent-of-leukocytes", "PICI CyTOF Immune Profiling")))
+blood_timepoints = ["C1D1", "C1D15", "C2D1", "C4D1"]
+sort(unique(x50.cell_population))
+```
+
+Baseline (C1D1) value per subject for one population:
+
+```{julia}
+function baseline(tab, population; timepoint="C1D1")
+    b = tab[(tab.cell_population .== population) .& (coalesce.(tab.timepoint_id, "") .== timepoint), :]
+    Dict(k.subject_id => mean(g.value) for (k, g) in pairs(groupby(b, :subject_id)))
+end
+```
+
+### CD38+ effector memory CD8 T cells (Fig. 3a, c)
+
+OS stratified by the pre-treatment frequency, above vs below the median:
+
+```{julia}
+pop = "CD38+ effector memory CD8+ T cells (% effector memory CD8 T cells)"
+km = survival_by_median(baseline(x50, pop), outcomes)
+println("log-rank p = ", metadata(km, "logrank").p)
+plot_survival(km; group="group", levels=["low", "high"], xlab="months",
+              title="OS by baseline CD38+ EM CD8 T cells (median split)")
+```
+
+Frequencies before and on treatment, grouped by 1-year survival, with each
+patient's trajectory:
+
+```{julia}
+plot_by_timepoint(x50[x50.cell_population .== pop, :]; group="status_1y", lines=true,
+                  timepoints=blood_timepoints, levels=status_levels,
+                  title="CD38+ EM CD8 T cells over treatment", ylab="% of EM CD8 T cells")
+```
+
+### PD-1+CD39+ EM1 CD4 T cells (Fig. 3d) and PD-1+Tbet+ non-naive CD4 T cells (Fig. 4f, h)
+
+```{julia}
+survival_plot(pop) = plot_survival(survival_by_median(baseline(x50, pop), outcomes); group="group",
+                                   levels=["low", "high"], xlab="months",
+                                   title="OS by baseline " * replace(pop, r" \(.*" => ""))
+survival_plot("PD-1+CD39+ effector memory 1 CD4+ T cells (% of effector memory 1 CD4 T cells)")
+```
+
+```{julia}
+survival_plot("PD-1+Tbet+ non-Naive CD4+ T cells (% of CD4 not naive T cells)")
+```
+
+### Cross-presenting dendritic cells (Fig. 4b)
+
+```{julia}
+pop = "CD1C+ CD141+ DC (% of leukocytes)"
+km = survival_by_median(baseline(cytof, pop), outcomes)
+plot_survival(km; group="group", levels=["low", "high"], xlab="months",
+              title="OS by baseline CD1c+ CD141+ DCs (CyTOF)")
+```
+
+### Proliferating T cells over treatment (Extended Data Fig. 3a)
+
+Change relative to C1D1 (log2 fold change of the frequency):
+
+```{julia}
+ki67 = change_from_baseline(x50[x50.cell_population .== "Ki67+ Non-Naive CD8 T Cells", :];
+                            baseline="C1D1", method=:log2_ratio, pseudocount=0.001)
+plot_by_timepoint(ki67; value="change", group="status_1y", lines=true,
+                  timepoints=blood_timepoints, levels=status_levels,
+                  title="Ki-67+ non-naive CD8 T cells, change from C1D1",
+                  ylab="log2 fold change vs C1D1")
+```
+
+### Screening all baseline populations
+
+Every X50 and CyTOF population at C1D1, median split, log-rank p (the paper's
+Fig. 5 summarizes such associations per arm):
+
+```{julia}
+function screen(tab, panel)
+    rows = NamedTuple[]
+    for pop in unique(tab.cell_population)
+        km = survival_by_median(baseline(tab, pop), outcomes)
+        lr = metadata(km, "logrank")
+        isnan(lr.p) && continue  # no baseline values for this population
+        ratio(g) = lr.observed[g] / lr.expected[g]
+        push!(rows, (panel=panel, cell_population=pop, n=nrow(km), p=round(lr.p, digits=3),
+                     higher_is=ratio("high") < ratio("low") ? "longer survival" : "shorter survival"))
+    end
+    DataFrame(rows)
+end
+assoc = sort(vcat(screen(x50, "X50"), screen(cytof, "CyTOF")), :p)
+first(assoc, 12)
+```
+
+## Marker expression on populations (Extended Data Figs. 7b, 8b)
+
+Median channel values of markers on CD38+ non-naive CD8 T cells, pre-treatment,
+per patient, z-scored per marker, patients annotated by 1-year survival:
+
+```{julia}
+mcv = with_status(measurements("median-channel-value", "PICI X50 Immune Profiling"))
+cd8 = mcv[(mcv.cell_population .== "CD38+ non-naive CD8+ T cells (% non-naive CD8 T cells)") .&
+          (coalesce.(mcv.timepoint_id, "") .== "C1D1"), :]
+m = to_matrix(cd8, "subject_id"; row="epitope_id")
+status = Dict(zip(outcomes.subject_id, outcomes.status_1y))
+plot_heatmap(m; scale=:row, col_groups=status,
+             title="Markers on CD38+ non-naive CD8 T cells (C1D1, z-scored MFI)")
+```
+
+CCR7+ CD11b+ CD27- B cells (CyTOF) on treatment (C1D15):
+
+```{julia}
+mcv_b = with_status(measurements("median-channel-value", "PICI CyTOF Immune Profiling"))
+b = mcv_b[coalesce.(mcv_b.timepoint_id, "") .== "C1D15", :]
+plot_heatmap(to_matrix(b, "subject_id"; row="epitope_id"); scale=:row, col_groups=status,
+             title="Markers on CCR7+ CD11b+ CD27- B cells (C1D15, z-scored MFI)")
+```
+
+## Serum proteins (Extended Data Fig. 3c–f)
+
+Olink NPX is on a log2 scale, so change from C1D1 is a difference:
+
+```{julia}
+olink = with_status(measurements("olink-npx", "PICI Olink Proteomics"))
+olink_change = change_from_baseline(olink; baseline="C1D1", method=:difference)
+protein_plot(label, id) = plot_by_timepoint(olink_change[olink_change.epitope_id .== id, :]; value="change",
+                                            group="status_1y", timepoints=blood_timepoints, levels=status_levels,
+                                            title="$label change from C1D1", ylab="log2 NPX change")
+protein_plot("IFNG", "IFNG")   # label, Olink id
+```
+
+```{julia}
+protein_plot("PD-1", "PDCD1")
+```
+
+```{julia}
+protein_plot("CXCL9", "CXCL9")
+```
+
+```{julia}
+protein_plot("CXCL10", "CXL10")
+```
+
+## Tumor: gene expression signatures and multiplex IF
+
+Pre-treatment tumor RNA-seq signature scores, clustered, patients annotated by
+1-year survival (Extended Data Figs. 4a, 6a). The RNA-seq data comes from the
+cBioPortal / iAtlas release, which labels the pre-treatment timepoint `0`
+(the PICI modalities use `screening` / `C1D1`):
+
+```{julia}
+sig = with_status(measurements("nanostring-signature-score", "cBioPortal Gene Expression Signatures"))
+sig_pre = sig[in.(coalesce.(sig.timepoint_id, ""), Ref(Set(["screening", "0"]))), :]
+sm = to_matrix(sig_pre, "subject_id"; row="signature")
+plot_heatmap(sm; scale=:row, col_groups=status,
+             title="Tumor gene expression signatures (pre-treatment, z-scored)")
+```
+
+OS by the Th1 signature (Extended Data Fig. 6b):
+
+```{julia}
+th1 = sig_pre[sig_pre.signature .== "Bindea_Th1_Cells", :]
+km = survival_by_median(Dict(k.subject_id => mean(g.value) for (k, g) in pairs(groupby(th1, :subject_id))), outcomes)
+plot_survival(km; group="group", levels=["low", "high"], xlab="months",
+              title="OS by tumor Th1 signature (median split)")
+```
+
+OS by intratumoral iNOS+ macrophages from multiplex IF (Extended Data Fig. 4c):
+
+```{julia}
+vectra = with_status(measurements("percent-of-total-cells", "PICI Vectra Multiplex IF"))
+inos = vectra[(vectra.cell_population .== "iNOS+ macrophages (% of total cells)") .&
+              (coalesce.(vectra.timepoint_id, "") .== "screening"), :]
+km = survival_by_median(Dict(k.subject_id => mean(g.value) for (k, g) in pairs(groupby(inos, :subject_id))), outcomes)
+plot_survival(km; group="group", levels=["low", "high"], xlab="months",
+              title="OS by tumor iNOS+ macrophages (median split)")
+```
+
+## Tumor mutations
+
+```{julia}
+v = variants()
+plot_mutation_landscape(v; n_genes=20, title="PRINCE mutation landscape (top 20 genes)")
+```
+
+## Provenance
+
+Every result records the database and the database basis t it was read at:
+
+```{julia}
+provenance(x50)
+```

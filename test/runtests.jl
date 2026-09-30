@@ -1,4 +1,5 @@
 using PatternQ, DataFrames, Statistics, Test
+import Transit   # the optional transit formats (PatternQTransitExt)
 
 @testset "offline" begin
     @testset "results" begin
@@ -72,6 +73,16 @@ using PatternQ, DataFrames, Statistics, Test
         p = plot_heatmap(transpose(m); scale=:row, col_groups=Dict("a" => "g1", "b" => "g2", "c" => "g1"))
         @test length(p.data) == 2
     end
+    @testset "transit responses decode to the JSON shape" begin
+        tj = """["^ ","query_result",[[["^ ","~:sample/id","S1","~:sample/type",["^ ","~:db/ident","~:sample.type/tumor"],"~:sample/recurrence",false,"~:sample/uid",["A","B"]],true,17592186270456,1.5,null,"~m1774995695170","~m1774995915903","~m0"]],"basis_t",42]"""
+        expected = PatternQ.tonative(PatternQ.JSON3.read("""{"query_result":[[{":sample/id":"S1",":sample/type":{":db/ident":":sample.type/tumor"},":sample/recurrence":false,":sample/uid":["A","B"]},true,17592186270456,1.5,null,"2026-03-31T22:21:35.17Z","2026-03-31T22:25:15.903Z","1970-01-01T00:00:00Z"]],"basis_t":42}"""))
+        for (fmt, bytes) in [("transit+json", Vector{UInt8}(tj)),
+                             ("transit+msgpack", Vector{UInt8}(Transit.to_transit(Transit.parse(IOBuffer(tj)), :msgpack)))]
+            res = PatternQ.decode_transit(bytes, fmt)
+            @test res == expected
+            @test res["query_result"][1][1] isa PatternQ.OrderedDict{String,Any}
+        end
+    end
 end
 
 if !isempty(get(ENV, "PATTERNQ_API_KEY", ""))
@@ -88,6 +99,17 @@ if !isempty(get(ENV, "PATTERNQ_API_KEY", ""))
             @test provenance(v).db == db
             gx = gene_expression(db=db, genes=["BAP1", "GNAQ"], measurement="rsem-normalized-count")
             @test Set(gx.hgnc_symbol) == Set(["BAP1", "GNAQ"])
+        end
+        @testset "transit formats match JSON" begin
+            db = tdb("tcga-uvm")
+            norm(df) = sort(select(df, sort(names(df))), [c for c in sort(names(df)) if !(eltype(df[!, c]) <: Union{Missing,AbstractVector})])
+            for f in (samples, variants)
+                a = norm(f(db=db, cache=false))
+                @test isequal(norm(f(db=db, format="transit+json")), a)
+                b = norm(f(db=db, format="transit+msgpack"))
+                @test names(b) == names(a) && nrow(b) == nrow(a)
+                @test all(c -> eltype(a[!, c]) <: Union{Missing,Real} ? isapprox(coalesce.(a[!, c], NaN), coalesce.(b[!, c], NaN); rtol=1e-6, nans=true) : isequal(a[!, c], b[!, c]), names(a))
+            end
         end
         @testset "tcga-uvm" begin
             db = tdb("tcga-uvm")

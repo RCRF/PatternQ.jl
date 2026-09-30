@@ -14,6 +14,15 @@ OrderedCollections = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
 PlotlyBase = "a03496cd-edff-5a9b-9e67-9cda94a718b5"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
+[weakdeps]
+Transit = "b8c3f9c4-01cc-4a0b-9481-f9ea896c1c39"
+
+[extensions]
+PatternQTransitExt = "Transit"
+
+[sources]
+Transit = {url = "https://github.com/vendekagon-labs/Transit.jl"}
+
 [compat]
 CodecZlib = "0.7"
 DataFrames = "1.6"
@@ -24,10 +33,12 @@ LinearAlgebra = "1"
 OrderedCollections = "1.6"
 PlotlyBase = "0.8"
 Statistics = "1"
+Transit = "0.8"
 julia = "1.10"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Transit = "b8c3f9c4-01cc-4a0b-9481-f9ea896c1c39"
 
 [targets]
-test = ["Test"]
+test = ["Test", "Transit"]

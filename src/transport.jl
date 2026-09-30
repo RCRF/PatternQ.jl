@@ -10,7 +10,9 @@
 #
 # Endpoints (bearer API token):
 #   POST /query/<db>   Accept text/plain -> presigned URL of the gzipped, S3-cached
-#                      result; Accept application/json -> inline JSON, cache skipped
+#                      result; Accept application/json -> inline JSON, cache skipped;
+#                      Accept application/transit+json / +msgpack -> inline transit,
+#                      cache skipped (optional: the Transit.jl extension)
 #   POST /datoms/<db>  -> {"datoms_chunk": [...], "basis_t": ...}
 #   POST /matrix/<db>/<key> -> presigned URL of a gzipped TSV matrix
 #   GET  /api-v1/list/datasets
@@ -66,8 +68,20 @@ function query_body(q::Query; args=Any[], timeout=30, refresh_cache=false)
     body
 end
 
+const RESPONSE_FORMATS = Dict("json" => "application/json",
+                              "transit+json" => "application/transit+json",
+                              "transit+msgpack" => "application/transit+msgpack")
+
 """
-    query(q; args=[], db=nothing, timeout=30, cache=true, refresh_cache=false, print_json=false)
+    decode_transit(body, format)
+
+Decode a transit query response into the shape of the JSON response. Defined
+by the PatternQTransitExt extension, which loads with Transit.jl.
+"""
+function decode_transit end
+
+"""
+    query(q; args=[], db=nothing, timeout=30, cache=true, refresh_cache=false, print_json=false, format="json")
 
 Run a query and return the parsed response: a Dict with "query_result",
 "basis_t" and "db_name". Most users want `do_query`, which returns a DataFrame.
@@ -75,16 +89,38 @@ Run a query and return the parsed response: a Dict with "query_result",
 `cache=true` uses the service's S3 result cache (presigned URL to a gzipped
 cached result, computed and cached on a miss); `cache=false` returns the result
 inline and skips the cache; `refresh_cache=true` recomputes and re-caches.
+
+`format` is the response format: "json" (default), "transit+json" or
+"transit+msgpack". The transit formats are always direct (they skip the S3
+cache whatever `cache` says) and need Transit.jl
+(`Pkg.add(url="https://github.com/vendekagon-labs/Transit.jl")`, then
+`import Transit`). Results are the same as with JSON, except that with
+"transit+msgpack" 32-bit float attributes (e.g. TPM) arrive at their exact
+stored value instead of the shortest decimal (0.045499999076 rather than
+0.0455), and pulled attributes may come in a different column order. Every
+function that passes keyword arguments to `do_query` passes it on.
 """
 function query(q::Query; args=Any[], db=nothing, timeout=30, cache::Bool=true,
-               refresh_cache::Bool=false, print_json::Bool=false)
+               refresh_cache::Bool=false, print_json::Bool=false, format::AbstractString="json")
     db = ensure_db(db)
+    haskey(RESPONSE_FORMATS, format) ||
+        error("format must be one of $(join(sort(collect(keys(RESPONSE_FORMATS))), ", ")), not $(repr(format))")
+    transit = format != "json"
+    if transit && Base.get_extension(@__MODULE__, :PatternQTransitExt) === nothing
+        error("format=\"$format\" needs Transit.jl: Pkg.add(url=\"https://github.com/vendekagon-labs/Transit.jl\"), then `import Transit`")
+    end
     body = JSON3.write(query_body(q; args=args, timeout=timeout, refresh_cache=refresh_cache))
     print_json && println(body)
-    accept = cache ? "text/plain" : "application/json"
+    accept = transit ? RESPONSE_FORMATS[format] : cache ? "text/plain" : "application/json"
     resp = HTTP.post("$(query_server())/query/$(db)", headers(accept), body;
                      status_exception=false, request_timeout=timeout + 30)
     raise_for(resp, "Query")
+    if transit && startswith(HTTP.header(resp, "Content-Type", ""), "application/transit")
+        res = decode_transit(resp.body, format)
+        get(res, "error", nothing) === nothing || error("Query error: $(res["error"])")
+        res["db_name"] = db
+        return res
+    end
     payload = strip(String(copy(resp.body)))
     raw = startswith(payload, "{") ? payload : String(fetch_presigned(payload))
     res = tonative(JSON3.read(raw))

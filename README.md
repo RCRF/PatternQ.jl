@@ -106,6 +106,27 @@ after your own joins). Every canned query has a `*_query` companion returning
 `cache=true` (the default) uses the service's S3 result cache; `cache=false`
 returns results inline and skips it; `refresh_cache=true` recomputes.
 
+### Advanced: transit responses
+
+Direct queries can also come back as transit: pass `format="transit+json"` or
+`format="transit+msgpack"` to any query function (it is passed through to
+`query`). This needs Transit.jl, which loads a package extension:
+`Pkg.add(url="https://github.com/vendekagon-labs/Transit.jl")`, then
+`import Transit`. In Julia, transit decodes large tabular results up to about
+twice as fast as JSON3.
+
+The transit formats always skip the S3 result cache. Results are the same as
+with JSON, with two exceptions:
+
+- with `transit+msgpack`, 32-bit float attributes (such as TPM) arrive at
+  their exact stored value instead of the shortest decimal (0.045499999076
+  rather than 0.0455);
+- pulled attributes may come back in a different column order.
+
+Query time on the service usually dominates. Transit responses are not
+gzip-compressed, so they are 4–5× larger on the wire than JSON; on a slow
+connection JSON can still be faster. JSON stays the default.
+
 Wide data (samples x targets) is a `LabeledMatrix` (`data`, `rows`, `cols`),
 from `to_matrix` or `measurements(...; wide=true)`.
 

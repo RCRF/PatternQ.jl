@@ -106,6 +106,16 @@ after your own joins). Every canned query has a `*_query` companion returning
 `cache=true` (the default) uses the service's S3 result cache; `cache=false`
 returns results inline and skips it; `refresh_cache=true` recomputes.
 
+### Rate limits and retries
+
+The commons API rate-limits each API key (600 requests a minute, at most 4 queries at once). When it throttles a call (HTTP 429 or 503), patternq waits as the server asks and retries, up to 5 times, and it waits out the rate limit instead of spending requests on refusals. Retries are logged with `@info`, and a call still throttled after the last retry throws
+`ThrottledError`. A query that times out on the server is not retried: narrow it or page it (the server caps
+query timeouts at 120 s). Tasks share a limit of 4 concurrent queries.
+
+```julia
+set_retry_policy!(max_retries=8, max_backoff=30)   # defaults: 5, 60 s, max_concurrency=4
+```
+
 ### Advanced: transit responses
 
 Direct queries can also come back as transit: pass `format="transit+json"` or

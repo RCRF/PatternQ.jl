@@ -26,6 +26,7 @@ using Statistics
 
 include("config.jl")
 include("results.jl")
+include("backpressure.jl")
 include("transport.jl")
 include("dataset.jl")
 include("measurements.jl")
@@ -39,7 +40,8 @@ include("plots.jl")
 # config / transport
 export query_server, set_query_server, set_token, set_db, current_db,
        query, query_body, do_query, across_dbs, datoms, list_datasets, resolve_db,
-       measurement_matrix, measurement_matrix_by_name
+       measurement_matrix, measurement_matrix_by_name,
+       set_retry_policy!, retry_policy, ThrottledError
 # results
 export provenance, keep_provenance, flatten_pull, clean_name, ident_name, join_many
 # dataset / measurements / clinical / reference

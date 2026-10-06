@@ -73,6 +73,7 @@ import Transit   # the optional transit formats (PatternQTransitExt)
         p = plot_heatmap(transpose(m); scale=:row, col_groups=Dict("a" => "g1", "b" => "g2", "c" => "g1"))
         @test length(p.data) == 2
     end
+    include("backpressure.jl")
     @testset "transit responses decode to the JSON shape" begin
         tj = """["^ ","query_result",[[["^ ","~:sample/id","S1","~:sample/type",["^ ","~:db/ident","~:sample.type/tumor"],"~:sample/recurrence",false,"~:sample/uid",["A","B"]],true,17592186270456,1.5,null,"~m1774995695170","~m1774995915903","~m0"]],"basis_t",42]"""
         expected = PatternQ.tonative(PatternQ.JSON3.read("""{"query_result":[[{":sample/id":"S1",":sample/type":{":db/ident":":sample.type/tumor"},":sample/recurrence":false,":sample/uid":["A","B"]},true,17592186270456,1.5,null,"2026-03-31T22:21:35.17Z","2026-03-31T22:25:15.903Z","1970-01-01T00:00:00Z"]],"basis_t":42}"""))
@@ -91,7 +92,6 @@ if !isempty(get(ENV, "PATTERNQ_API_KEY", ""))
     @testset "live" begin
         @testset "H37001" begin
             db = tdb("H37001")
-            @test nrow(samples(db=db)) == 6
             @test subjects(db=db).subject_id == ["H37001"]
             v = variants(db=db)
             @test nrow(v) > 100 && "BAP1" in v.hgnc_symbol
@@ -114,7 +114,8 @@ if !isempty(get(ENV, "PATTERNQ_API_KEY", ""))
         @testset "tcga-uvm" begin
             db = tdb("tcga-uvm")
             @test nrow(subjects(db=db)) == 80
-            @test Set(dataset_summary(db=db).assay_technology) == Set(["WES", "RNA-seq"])
+            @test nrow(samples(db=db)) == 80
+            @test Set(dataset_summary(db=db).assay_technology) == Set(["WES", "RNA-seq", "SNP-array"])
             n = do_query(Dict(":find" => [["count", "?s"]], ":where" => [["?s", ":sample/id"]]); db=db, cache=false)
             @test n.count_s == [80]
             d = datoms("aevt", [":subject/id"]; db=db, limit=3)

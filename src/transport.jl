@@ -26,11 +26,17 @@ function raise_for(resp, what)
     resp.status == 200 && return
     body = String(copy(resp.body))
     msg = body
+    timed_out = false
     try
         parsed = JSON3.read(body)
-        parsed isa JSON3.Object && haskey(parsed, :error) && (msg = string(parsed[:error]))
+        if parsed isa JSON3.Object && haskey(parsed, :error)
+            msg = string(parsed[:error])
+            timed_out = get(parsed, :timeout, false) === true
+        end
     catch
     end
+    timed_out && error("$what timed out on the server: $msg. Narrow the query or page it (e.g. fewer " *
+                       "args per call); the server caps query timeouts at $(max_timeout_ms() ÷ 1000) s.")
     resp.status == 401 && (msg = "not authorized; check PATTERNQ_API_KEY / set_token(). " * msg)
     resp.status == 403 && (msg = "forbidden; your API key may not have access to this dataset. " * msg)
     error("$what failed (HTTP $(resp.status)): $msg")
@@ -111,9 +117,13 @@ function query(q::Query; args=Any[], db=nothing, timeout=30, cache::Bool=true,
     end
     body = JSON3.write(query_body(q; args=args, timeout=timeout, refresh_cache=refresh_cache))
     print_json && println(body)
+    timeout * 1000 > max_timeout_ms() &&
+        @warn "timeout=$timeout s is above the server's cap of $(max_timeout_ms() ÷ 1000) s; the query will be canceled at the cap"
     accept = transit ? RESPONSE_FORMATS[format] : cache ? "text/plain" : "application/json"
-    resp = HTTP.post("$(query_server())/query/$(db)", headers(accept), body;
-                     status_exception=false, request_timeout=timeout + 30)
+    resp = send_api("Query"; limited=true) do
+        HTTP.post("$(query_server())/query/$(db)", headers(accept), body;
+                  status_exception=false, retry=false, request_timeout=timeout + 30)
+    end
     raise_for(resp, "Query")
     if transit && startswith(HTTP.header(resp, "Content-Type", ""), "application/transit")
         res = decode_transit(resp.body, format)
@@ -204,8 +214,10 @@ function datoms(index::AbstractString, components=Any[]; db=nothing, offset=0, l
     db = ensure_db(db)
     body = JSON3.write(Dict("index" => ":" * lstrip(index, ':'), "components" => components,
                             "offset" => offset, "limit" => limit))
-    resp = HTTP.post("$(query_server())/datoms/$(db)", headers("application/json"), body;
-                     status_exception=false, request_timeout=timeout + 2)
+    resp = send_api("Datoms request"; limited=true) do
+        HTTP.post("$(query_server())/datoms/$(db)", headers("application/json"), body;
+                  status_exception=false, retry=false, request_timeout=timeout + 2)
+    end
     raise_for(resp, "Datoms request")
     res = tonative(JSON3.read(resp.body))
     chunk = get(res, "datoms_chunk", Any[])
@@ -224,8 +236,10 @@ Datasets available to your API key: dataset, db (current database name),
 patient_count, sample_count, assays, tags.
 """
 function list_datasets()
-    resp = HTTP.get("$(query_server())/api-v1/list/datasets", headers("application/json");
-                    status_exception=false, request_timeout=60)
+    resp = send_api("Listing datasets") do
+        HTTP.get("$(query_server())/api-v1/list/datasets", headers("application/json");
+                 status_exception=false, retry=false, request_timeout=60)
+    end
     raise_for(resp, "Listing datasets")
     ds = get(tonative(JSON3.read(resp.body)), "datasets", Any[])
     getdb(d) = (x = get(d, "dataset/database", nothing); x isa AbstractDict ? get(x, "database/name", missing) : missing)
@@ -259,8 +273,10 @@ Download a measurement matrix (e.g. single-cell counts) by its backing-file key
 """
 function measurement_matrix(matrix_key::AbstractString; db=nothing)
     db = ensure_db(db)
-    resp = HTTP.post("$(query_server())/matrix/$(db)/$(matrix_key)", headers("text/plain"), "{}";
-                     status_exception=false, request_timeout=120)
+    resp = send_api("Matrix request") do
+        HTTP.post("$(query_server())/matrix/$(db)/$(matrix_key)", headers("text/plain"), "{}";
+                  status_exception=false, retry=false, request_timeout=120)
+    end
     raise_for(resp, "Matrix request")
     content = String(fetch_presigned(String(copy(resp.body))))
     lines = split(chomp(content), '\n')

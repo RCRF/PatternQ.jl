@@ -15,27 +15,55 @@ function measurement_set_eids(measurement_set, db; kwargs...)
     Int.(r.ms)
 end
 
-# Up to `limit` measurement ids of set `ms` in index order, starting at
-# `offset`, and whether they reach the end of the set.
-function set_measurement_ids(ms, db, limit; offset=0)
-    ids = Int[]
-    while length(ids) < limit
-        want = min(PAGE, limit - length(ids))
-        page = datoms("eavt", Any[ms, ":measurement-set/measurements"]; db=db,
-                      offset=offset + length(ids), limit=want)
-        append!(ids, Int.(page.v))
-        nrow(page) < want && return ids, true
+# Up to `limit` measurement ids of set `ms` from `pos`, and the position after
+# them, or nothing at the end of the set. A position is (offset, cursor): the
+# cursor when the server pages by cursor, else the offset. A cursor page
+# answered without one (an instance from before cursor paging, during a deploy
+# or a rollback) is read again by offset, never repeated.
+function set_page(ms, db, limit, pos)
+    offset, after = pos isa Tuple ? pos : (pos, nothing)
+    cursor(p) = "cursor" in metadatakeys(p) && metadata(p, "cursor")
+    page = datoms("eavt", Any[ms, ":measurement-set/measurements"]; db=db,
+                  offset=after === nothing ? offset : 0, limit=limit, after=after)
+    if after !== nothing && !cursor(page)
+        page = datoms("eavt", Any[ms, ":measurement-set/measurements"]; db=db, offset=offset, limit=limit)
     end
-    nxt = datoms("eavt", Any[ms, ":measurement-set/measurements"]; db=db, offset=offset + length(ids), limit=1)
-    ids, nrow(nxt) == 0
+    ids = Int.(page.v)
+    stop = offset + length(ids)
+    if cursor(page)
+        nxt = metadata(page, "next")
+        return ids, (nxt === nothing ? nothing : (stop, nxt))
+    end
+    ids, (length(ids) < limit ? nothing : (stop, nothing))
+end
+
+# Up to `limit` measurement ids of set `ms` in index order, and whether they
+# reach the end of the set.
+function set_measurement_ids(ms, db, limit)
+    ids = Int[]
+    pos = 0
+    while length(ids) < limit
+        got, pos = set_page(ms, db, min(PAGE, limit - length(ids)), pos)
+        append!(ids, got)
+        pos === nothing && return ids, true
+    end
+    more, _ = set_page(ms, db, 1, pos)
+    ids, isempty(more)
 end
 
 # (count, exact): the set's measurement count when it is at most `cap`, else
-# (cap, false). One page for a small set. A set filling the first page gets one
-# probe past the cap, then one-datom probes binary-search the 10000-wide block
-# it ends in, and one page of that block finishes the count: about six round
-# trips for any size, instead of a page per 10000.
+# (cap, false). Counted in place on the server when it can; otherwise one page
+# for a small set, and for a set filling the first page one probe past the cap,
+# then one-datom probes binary-search the 10000-wide block it ends in and one
+# page of that block finishes the count: about six round trips for any size,
+# instead of a page per 10000.
 function count_set_measurements(ms, db, cap)
+    counted = datoms_count("eavt", Any[ms, ":measurement-set/measurements"]; db=db, cap=cap)
+    if counted !== nothing
+        n, exact = counted
+        return exact && n <= cap ? (n, true) : (cap, false)
+    end
+    cap = min(cap, 100000)  # the deepest offset paging goes
     page(offset, limit) = nrow(datoms("eavt", Any[ms, ":measurement-set/measurements"]; db=db,
                                       offset=offset, limit=limit))
     step = 10000
@@ -51,14 +79,16 @@ function count_set_measurements(ms, db, cap)
 end
 
 """
-    measurement_sets(; db=nothing, count_cap=100000)
+    measurement_sets(; db=nothing, count_cap=1000000)
 
 assay_name, assay_technology, measurement_set_name, measurement_count,
 measurement_count_exact. Counting never binds a whole set in one query: a set
 with more than `count_cap` measurements reports `count_cap` with
-measurement_count_exact = false (read it as "at least").
+measurement_count_exact = false (read it as "at least"). The server counts in
+place; one without in-place counts is paged instead, capped at 100000 (the
+deepest it pages by offset).
 """
-function measurement_sets(; db=nothing, count_cap=100000, kwargs...)
+function measurement_sets(; db=nothing, count_cap=1000000, kwargs...)
     db = ensure_db(db)
     df = dataset_summary(; db=db, kwargs...)
     sets = runq(dq(["?ms", "?measurement-set-name"],
@@ -129,10 +159,10 @@ function measurement_set_attributes(measurement_set::AbstractString; db=nothing,
     attr = measurement === nothing ? nothing : measurement_attr(measurement)
     found = Int[]
     for ms in measurement_set_eids(measurement_set, db)
-        offset = 0
-        for _ in 1:10  # the server caps datoms offsets at 100000
-            ids, complete = set_measurement_ids(ms, db, attr === nothing ? n : PAGE; offset=offset)
-            offset += length(ids)
+        pos = 0
+        for _ in 1:10  # 100000 measurements at most, the server's offset cap
+            ids, pos = set_page(ms, db, attr === nothing ? n : PAGE, pos)
+            complete = pos === nothing
             if attr !== nothing && !isempty(ids)
                 r = runq(dq(["?m"], [["?m", attr]]; in=[["?m", "..."]], args=[ids]); db=db)
                 ids = nrow(r) > 0 ? Int.(r.m) : Int[]

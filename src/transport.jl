@@ -206,14 +206,20 @@ function across_dbs(q::Query, dbs; args=Any[], kwargs...)
 end
 
 """
-    datoms(index, components=[]; db=nothing, offset=0, limit=1000)
+    datoms(index, components=[]; db=nothing, offset=0, limit=1000, after=nothing)
 
-Raw datoms from an index ("eavt", "aevt", "avet", "vaet"): columns e, a, v, tx.
+Raw datoms from an index ("eavt", "aevt", "avet", "vaet"): columns e, a, v, tx;
+from `offset`, or with `after` from the cursor a previous page returned
+(offsets past 100000 need it). A server with cursor paging sets the result's
+metadata "cursor" to true and "next" to the next page's cursor (nothing at the
+end of the range).
 """
-function datoms(index::AbstractString, components=Any[]; db=nothing, offset=0, limit=1000, timeout=30)
+function datoms(index::AbstractString, components=Any[]; db=nothing, offset=0, limit=1000, timeout=30,
+                after=nothing)
     db = ensure_db(db)
-    body = JSON3.write(Dict("index" => ":" * lstrip(index, ':'), "components" => components,
-                            "offset" => offset, "limit" => limit))
+    req = Dict{String,Any}("index" => ":" * lstrip(index, ':'), "components" => components, "limit" => limit)
+    after === nothing ? (req["offset"] = offset) : (req["after"] = after)
+    body = JSON3.write(req)
     resp = send_api("Datoms request"; limited=true) do
         HTTP.post("$(query_server())/datoms/$(db)", headers("application/json"), body;
                   status_exception=false, retry=false, request_timeout=timeout + 2)
@@ -226,7 +232,32 @@ function datoms(index::AbstractString, components=Any[]; db=nothing, offset=0, l
     for c in names(df)
         df[!, c] = tidy_column(df[!, c])
     end
-    with_provenance(df, db, get(res, "basis_t", nothing))
+    df = with_provenance(df, db, get(res, "basis_t", nothing))
+    metadata!(df, "cursor", haskey(res, "next"); style=:note)
+    metadata!(df, "next", get(res, "next", nothing); style=:note)
+    df
+end
+
+const COUNT_UNSUPPORTED = Set{String}()
+
+# (count, exact) of the datoms in an index range, counted on the server without
+# transferring them, or nothing when the server can't count in place (before
+# cursor paging). limit = 1: such a server answers with a one-datom page.
+function datoms_count(index::AbstractString, components; db, cap=1000000, timeout=30)
+    query_server() in COUNT_UNSUPPORTED && return nothing
+    body = JSON3.write(Dict("index" => ":" * lstrip(index, ':'), "components" => components,
+                            "count" => true, "cap" => cap, "limit" => 1))
+    resp = send_api("Datoms count"; limited=true) do
+        HTTP.post("$(query_server())/datoms/$(db)", headers("application/json"), body;
+                  status_exception=false, retry=false, request_timeout=timeout + 2)
+    end
+    raise_for(resp, "Datoms count")
+    res = tonative(JSON3.read(resp.body))
+    if !haskey(res, "count")
+        push!(COUNT_UNSUPPORTED, query_server())
+        return nothing
+    end
+    Int(res["count"]), Bool(get(res, "exact", true))
 end
 
 """

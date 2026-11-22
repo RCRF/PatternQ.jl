@@ -47,7 +47,7 @@ export provenance, keep_provenance, flatten_pull, clean_name, ident_name, join_m
 # dataset / measurements / clinical / reference
 export samples, samples_query, subjects, subjects_query, dataset_summary, dataset_summary_query,
        dataset_info, schema_info, measurement_sets, measurement_types, measurement_set_attributes,
-       sample_assays, measurement_matrices, measurements, measurements_query, variants, variants_query,
+       sample_assays, sample_assays_query, measurement_matrices, measurements, measurements_query, variants, variants_query,
        gene_expression, gene_expression_query, isoforms, cnv_segments, cnv_gene_calls,
        timepoints, clinical_observation_sets, clinical_observations, subject_outcomes,
        adverse_events, clinical_interventions, cell_populations, tcrs, otus, sgbs,

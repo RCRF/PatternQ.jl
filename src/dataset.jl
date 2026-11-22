@@ -93,6 +93,29 @@ function schema_info(; db=nothing, kwargs...)
     (name=r.name[1], version=r.version[1])
 end
 
+# Datomic joins in clause order. lead_with reorders `where` to start from
+# `lead`, the clauses of the subset the caller bound (genes, samples), then each
+# remaining clause as soon as it shares a variable with those placed, so a query
+# never starts on a whole attribute (every variant, CNV, or expression
+# measurement) and filters at the end. Starting from a few samples walks only
+# their measurements; a subject can own most of a dataset (a single-participant
+# deep dive), so subject-only queries start from the measurement attribute.
+const SAMPLE_LEAD = Any[["?s", ":sample/id", "?sample-id"], ["?m", ":measurement/sample", "?s"]]
+
+function lead_with(where, lead)
+    vars_of(c) = Set(x for x in c if x isa AbstractString && startswith(x, "?"))
+    out = Any[lead...]
+    bound = isempty(out) ? Set{String}() : union(map(vars_of, out)...)
+    rest = Any[c for c in where if !(c in lead)]
+    while !isempty(rest)
+        i = something(findfirst(c -> !isempty(intersect(vars_of(c), bound)), rest), 1)
+        c = popat!(rest, i)
+        push!(out, c)
+        union!(bound, vars_of(c))
+    end
+    out
+end
+
 # -- variants --------------------------------------------------------------------
 
 function variants_query(; samples=nothing, genes=nothing, measurement_set=nothing)
@@ -107,6 +130,12 @@ function variants_query(; samples=nothing, genes=nothing, measurement_set=nothin
         push!(ins, ["?gene", "..."]); push!(args, collect(genes))
     end
     measurement_set === nothing || (push!(ins, "?measurement-set"); push!(args, measurement_set))
+    if genes !== nothing
+        where = lead_with(where, Any[["?g", ":gene/hgnc-symbol", "?gene"], ["?v", ":variant/gene", "?g"],
+                                     ["?m", ":measurement/variant", "?v"]])
+    elseif samples !== nothing
+        where = lead_with(where, SAMPLE_LEAD)
+    end
     dq(Any["?sample-id", "?measurement-set", "?vaf",
            ["pull", "?v", Any[":variant/id", ":variant/HGVSp", ":variant/HGVSc",
                               Dict(":variant/gene" => [":gene/hgnc-symbol"]), EnumRef(":variant/impact")]],
@@ -147,6 +176,7 @@ function gene_expression_query(; genes=nothing, samples=nothing, measurement="tp
     genes === nothing || (push!(ins, ["?hgnc-symbol", "..."]); push!(args, collect(genes)))
     samples === nothing || (push!(ins, ["?sample-id", "..."]); push!(args, collect(samples)))
     measurement_set === nothing || (push!(ins, "?measurement-set"); push!(args, measurement_set))
+    genes === nothing && samples !== nothing && (where = lead_with(where, SAMPLE_LEAD))
     dq(["?sample-id", "?hgnc-symbol", "?measurement-set", "?value"], where; in=ins, args=args, with=["?m"])
 end
 

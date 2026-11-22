@@ -152,7 +152,7 @@ if !isempty(get(ENV, "PATTERNQ_API_KEY", ""))
             @test nrow(cnv_segments(db=db, subjects=["H37004"])) > nrow(cs)
             @test "isoform_percent" in names(isoforms("TP53"; db=db))
             @test nrow(clinical_interventions(db=db)) > 0
-            @test nrow(measurement_matrices(db=db)) == 2
+            @test nrow(measurement_matrices(db=db)) == 6
         end
         @testset "painter: gene-level CNV calls" begin
             db = tdb("painter-2025-angiosarc")

@@ -126,6 +126,8 @@ end
 One row per intervention (treatments, surgeries, biopsies, ...).
 """
 function clinical_interventions(; db=nothing, subjects=nothing, kwargs...)
+    db = ensure_db(db)
+    installed(db, ":clinical-intervention/subject"; kwargs...) || return DataFrame()
     ins = Any[]; args = Any[]
     subjects === nothing || (push!(ins, ["?subject-id", "..."]); push!(args, collect(subjects)))
     df = runq(dq([["pull", "?ci", Any["*",

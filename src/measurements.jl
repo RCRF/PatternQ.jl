@@ -262,9 +262,14 @@ sample_assays_query() = dq(["?sample-id", "?assay-name", "?assay-technology", "?
                             ["?ms", ":measurement-set/includes-samples", "?s"],
                             ["?s", ":sample/id", "?sample-id"]])
 
-has_includes_samples(db; kwargs...) =
-    nrow(runq(dq(["?a"], [["?a", ":db/ident", "?ident"]]; in=["?ident"],
-                 args=[":measurement-set/includes-samples"]); db=db, kwargs...)) > 0
+# Whether every attribute in idents is installed in db. A clause on an attribute
+# a database lacks fails the whole query (HTTP 400, not-an-entity); callers check
+# first and return no rows.
+installed(db, idents::AbstractString...; kwargs...) =
+    nrow(runq(dq(["?ident"], [["?a", ":db/ident", "?ident"]]; in=[["?ident", "..."]],
+                 args=[collect(idents)]); db=db, kwargs...)) == length(unique(idents))
+
+has_includes_samples(db; kwargs...) = installed(db, ":measurement-set/includes-samples"; kwargs...)
 
 """
     sample_assays(; db=nothing)
@@ -513,6 +518,7 @@ At least one of genes, samples, subjects is required.
 function cnv_segments(; db=nothing, genes=nothing, samples=nothing, subjects=nothing, kwargs...)
     require_cnv_subset(genes, samples, subjects)
     db = ensure_db(db)
+    installed(db, ":measurement/cnv"; kwargs...) || return DataFrame()
     genes === nothing || return cnv_segments_run(db, genes, samples, subjects, nothing, Int[]; kwargs...)
     run_cnv_plan((ids, start, sets) -> cnv_segments_run(db, nothing, ids, subjects, start, sets; kwargs...),
                  ":measurement/cnv", samples, subjects, db; kwargs...)
@@ -559,6 +565,7 @@ function cnv_gene_calls(; db=nothing, genes=nothing, samples=nothing, subjects=n
                         measurement="cnv-call-score", kwargs...)
     require_cnv_subset(genes, samples, subjects)
     db = ensure_db(db)
+    installed(db, measurement_attr(measurement); kwargs...) || return DataFrame()
     genes === nothing || return cnv_gene_calls_run(db, genes, samples, subjects, measurement, nothing, Int[]; kwargs...)
     run_cnv_plan((ids, start, sets) -> cnv_gene_calls_run(db, nothing, ids, subjects, measurement, start, sets; kwargs...),
                  measurement_attr(measurement), samples, subjects, db; kwargs...)
@@ -578,7 +585,9 @@ function cnv_gene_calls_run(db, genes, samples, subjects, measurement, start, se
     samples === nothing || (push!(ins, ["?sample-id", "..."]); push!(args, collect(samples)))
     add_subject_filter!(where, ins, args, subjects)
     isempty(sets) || (push!(ins, ["?ms", "..."]); push!(args, sets))
-    start === :samples && (where = lead_with(where, SAMPLE_LEAD))
+    # the CNV attribute right after the sample, before the per-row gene joins
+    start === :samples &&
+        (where = lead_with(where, vcat(SAMPLE_LEAD, Any[["?m", attr, enum ? "?value-ref" : "?value"]])))
     start === :sets && (where = lead_with(where, Any[["?ms", ":measurement-set/measurements", "?m"]]))
     df = runq(dq(["?sample-id", "?measurement-set", "?hgnc-symbol", "?value"], where; in=ins, args=args,
                  with=["?m"]); db=db, kwargs...)

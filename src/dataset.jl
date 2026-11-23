@@ -264,7 +264,10 @@ function gene_expression_query(; genes=nothing, samples=nothing, measurement="tp
     genes === nothing || (push!(ins, ["?hgnc-symbol", "..."]); push!(args, collect(genes)))
     samples === nothing || (push!(ins, ["?sample-id", "..."]); push!(args, collect(samples)))
     measurement_set === nothing || (push!(ins, "?measurement-set"); push!(args, measurement_set))
-    genes === nothing && samples !== nothing && (where = lead_with(where, SAMPLE_LEAD))
+    # the value clause right after the sample: a sample's measurements are every
+    # assay's, so drop the others before the per-row gene joins
+    genes === nothing && samples !== nothing &&
+        (where = lead_with(where, vcat(SAMPLE_LEAD, Any[["?m", measurement_attr(measurement), "?value"]])))
     dq(["?sample-id", "?hgnc-symbol", "?measurement-set", "?value"], where; in=ins, args=args, with=["?m"])
 end
 

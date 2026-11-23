@@ -273,9 +273,10 @@ Which samples were measured by which measurement sets: subject_id, sample_id,
 timepoint_id, assay_name, assay_technology, measurement_set_name.
 
 Reads `:measurement-set/includes-samples`, the enrichment that lists each set's
-samples (schema 0.3.18), so nothing walks the measurements. A database from
-before that enrichment falls back to walking each set's measurements, which can
-time out on large expression sets.
+samples (schema 0.3.18), so nothing walks the measurements. A database without
+it uses unify-central's stored sample index when the service has a current
+copy, else datoms seeks: slow on a large cohort (about two requests per sample
+and set), but no query walks the measurements.
 """
 function sample_assays(; db=nothing, kwargs...)
     db = ensure_db(db)
@@ -288,25 +289,159 @@ function sample_assays(; db=nothing, kwargs...)
         out = rightjoin(select(smp, keep), df; on=:sample_id)
         return keep_provenance(order_columns(out, ["subject_id", "sample_id", "timepoint_id"]), df)
     end
-    # older database: walk each set's measurement -> sample refs
-    sets = dataset_summary(; db=db)
-    parts = DataFrame[]
-    for row in eachrow(sets)
-        r = runq(dq(["?sample-id"], [["?ms", ":measurement-set/name", "?ms-name"],
-                                      ["?ms", ":measurement-set/measurements", "?m"],
-                                      ["?m", ":measurement/sample", "?s"], ["?s", ":sample/id", "?sample-id"]];
-                    in=["?ms-name"], args=[row.measurement_set_name]); db=db, kwargs...)
-        nrow(r) == 0 && continue
-        push!(parts, DataFrame(sample_id=r.sample_id, assay_name=row.assay_name,
-                               assay_technology=row.assay_technology,
-                               measurement_set_name=row.measurement_set_name))
-    end
-    isempty(parts) && return DataFrame()
-    df = vcat(parts...)
+    found = sample_assays_from_index(db)
+    found === nothing && (found = sample_assays_by_seek(db; kwargs...))
+    nrow(found) == 0 && return DataFrame()
     smp = samples(; db=db)
     keep = intersect(["sample_id", "subject_id", "timepoint_id"], names(smp))
-    out = rightjoin(select(smp, keep), df; on=:sample_id)
+    out = rightjoin(select(smp, keep), found; on=:sample_id)
     keep_provenance(order_columns(out, ["subject_id", "sample_id", "timepoint_id"]), smp)
+end
+
+sample_assay_frame() = DataFrame(sample_id=String[], assay_name=String[], assay_technology=String[],
+                                 measurement_set_name=String[])
+
+# sample_assays rows from unify-central's stored sample index, or nothing when
+# the service has no current copy.
+function sample_assays_from_index(db)
+    index = sample_index(db)
+    index === nothing && return nothing
+    sets = get(index, "measurement_sets", Dict()); smp = get(index, "samples", Dict())
+    out = sample_assay_frame()
+    for (ms, keys) in get(index, "set_samples", Dict()), k in keys
+        (haskey(smp, k) && haskey(sets, ms)) || continue
+        m = sets[ms]
+        push!(out, (string(smp[k]["id"]), string(something(get(m, "assay", nothing), missing)),
+                    string(something(get(m, "assay_type", nothing), missing)), string(get(m, "name", ms))))
+    end
+    out
+end
+
+# The links from a measurement set to its samples: the set's ref to its
+# members, and each member's ref to its sample. Matrices list their samples
+# directly.
+const SET_LINKS = [(":measurement-set/measurements", ":measurement/sample"),
+                   (":measurement-set/single-cells", ":single-cell/sample")]
+const SEEK_STEPS = 8
+
+function seek1(index, components, db)
+    d = datoms(index, components; db=db, limit=1, seek=true)
+    nrow(d) == 0 ? nothing : (e=Int(d.e[1]), a=d.a[1], v=d.v[1])
+end
+
+# The highest member id of set `ms` through `link`: one offset read for a set
+# within the server's offset cap, else seeks, doubling then halving the
+# distance from `lo` (each seek lands on the first member at or past an id).
+function last_member(ms, link, lo, db)
+    n = datoms_count("eavt", Any[ms, link]; db=db, cap=100001)
+    if n !== nothing && n[2]
+        return Int(datoms("eavt", Any[ms, link]; db=db, offset=n[1] - 1, limit=1).v[1])
+    end
+    function at(x)
+        d = seek1("eavt", Any[ms, link, x], db)
+        d !== nothing && d.a == link && d.e == ms ? Int(d.v) : nothing
+    end
+    low, step = lo, 1
+    high = lo
+    while true
+        v = at(lo + step)
+        if v === nothing
+            high = lo + step
+            break
+        end
+        low, step = v, step * 2
+    end
+    while high - low > 1
+        mid = (low + high) ÷ 2
+        v = at(mid)
+        v === nothing ? (high = mid) : (low = v)
+    end
+    low
+end
+
+# One page of entity `e`'s `link` values from `pos` (an offset or a cursor), and
+# the next position, or nothing at the end.
+function link_page(e, link, db, pos)
+    after = pos isa AbstractString ? pos : nothing
+    page = datoms("eavt", Any[e, link]; db=db, offset=after === nothing ? pos : 0, limit=PAGE, after=after)
+    vals = Int.(page.v)
+    if "cursor" in metadatakeys(page) && metadata(page, "cursor")
+        return vals, metadata(page, "next")
+    end
+    vals, (length(vals) < PAGE ? nothing : pos + length(vals))
+end
+
+# sample_assays rows for a database without :measurement-set/includes-samples
+# or a stored sample index, from datoms seeks only: no query binds a set's or a
+# sample's measurements. For each set its first and last member ids; then for
+# each sample and set, a seek into the sample's members (VAET) at the set's
+# first id, and one lookup of the hit's sets. Sets' ids interleave, so a hit in
+# another set (which it also records) moves the seek past it, up to SEEK_STEPS
+# times; past that, one query settles that sample alone. About two requests per
+# sample and set, each also an audit write on the service: slow on a large
+# cohort, but it never walks the data.
+function sample_assays_by_seek(db; kwargs...)
+    meta = runq(dq(["?ms", "?assay-name", "?assay-technology", "?measurement-set-name"],
+                   [["?a", ":assay/name", "?assay-name"], ["?a", ":assay/technology", "?t"],
+                    ["?t", ":db/ident", "?assay-technology"], ["?a", ":assay/measurement-sets", "?ms"],
+                    ["?ms", ":measurement-set/name", "?measurement-set-name"]]); db=db, kwargs...)
+    ids = runq(dq(["?s", "?sample-id"], [["?s", ":sample/id", "?sample-id"]]); db=db, kwargs...)
+    (nrow(meta) == 0 || nrow(ids) == 0) && return sample_assay_frame()
+    sample_id = Dict(Int(e) => String(x) for (e, x) in zip(ids.s, ids.sample_id))
+    members = Dict(Int(ms) => Set{Int}() for ms in meta.ms)
+    ranges = NamedTuple[]
+    for ms in Int.(meta.ms)
+        for (set_link, sample_link) in SET_LINKS
+            first_page = datoms("eavt", Any[ms, set_link]; db=db, limit=1)
+            nrow(first_page) == 0 && continue
+            lo = Int(first_page.v[1])
+            push!(ranges, (ms=ms, set_link=set_link, sample_link=sample_link, lo=lo, hi=last_member(ms, set_link, lo, db)))
+        end
+        for mm in Int.(datoms("eavt", Any[ms, ":measurement-set/measurement-matrices"]; db=db, limit=10000).v)
+            pos = 0
+            while pos !== nothing
+                got, pos = link_page(mm, ":measurement-matrix/samples", db, pos)
+                union!(members[ms], got)
+            end
+        end
+    end
+    owners(m, set_link) = Int.(datoms("vaet", Any[m, set_link]; db=db, limit=100).e)
+    function check(s)
+        hits = Set{Int}()
+        for r in ranges
+            r.ms in hits && continue
+            pos, settled = r.lo, false
+            for _ in 1:SEEK_STEPS
+                d = seek1("vaet", Any[s, r.sample_link, pos], db)
+                if d === nothing || d.a != r.sample_link || Int(d.v) != s || d.e > r.hi
+                    settled = true
+                    break
+                end
+                of = owners(d.e, r.set_link)
+                union!(hits, of)
+                if r.ms in of
+                    settled = true
+                    break
+                end
+                pos = d.e + 1
+            end
+            if !settled
+                q = runq(dq(["?m"], [["?m", r.sample_link, "?s"], ["?ms", r.set_link, "?m"]];
+                            in=["?s", "?ms"], args=[s, r.ms]); db=db, kwargs...)
+                nrow(q) > 0 && push!(hits, r.ms)
+            end
+        end
+        s, hits
+    end
+    for (s, hits) in asyncmap(check, collect(keys(sample_id)); ntasks=4), ms in hits
+        haskey(members, ms) && push!(members[ms], s)
+    end
+    out = sample_assay_frame()
+    for row in eachrow(meta), s in members[Int(row.ms)]
+        haskey(sample_id, s) && push!(out, (sample_id[s], row.assay_name, ident_name(row.assay_technology),
+                                            row.measurement_set_name))
+    end
+    out
 end
 
 """
@@ -377,6 +512,13 @@ At least one of genes, samples, subjects is required.
 """
 function cnv_segments(; db=nothing, genes=nothing, samples=nothing, subjects=nothing, kwargs...)
     require_cnv_subset(genes, samples, subjects)
+    db = ensure_db(db)
+    genes === nothing || return cnv_segments_run(db, genes, samples, subjects, nothing, Int[]; kwargs...)
+    run_cnv_plan((ids, start, sets) -> cnv_segments_run(db, nothing, ids, subjects, start, sets; kwargs...),
+                 ":measurement/cnv", samples, subjects, db; kwargs...)
+end
+
+function cnv_segments_run(db, genes, samples, subjects, start, sets; kwargs...)
     where = Any[["?m", ":measurement/cnv", "?c"], ["?c", ":cnv/id", "?cnv-id"], ["?m", ":measurement/sample", "?s"],
                 ["?s", ":sample/id", "?sample-id"], ["?ms", ":measurement-set/measurements", "?m"],
                 ["?ms", ":measurement-set/name", "?measurement-set"]]
@@ -395,7 +537,9 @@ function cnv_segments(; db=nothing, genes=nothing, samples=nothing, subjects=not
     end
     samples === nothing || (push!(ins, ["?sample-id", "..."]); push!(args, collect(samples)))
     add_subject_filter!(where, ins, args, subjects)
-    genes === nothing && samples !== nothing && (where = lead_with(where, SAMPLE_LEAD))
+    isempty(sets) || (push!(ins, ["?ms", "..."]); push!(args, sets))
+    start === :samples && (where = lead_with(where, SAMPLE_LEAD))
+    start === :sets && (where = lead_with(where, Any[["?ms", ":measurement-set/measurements", "?m"]]))
     df = runq(dq(find, where; in=ins, args=args); db=db, kwargs...)
     for n in names(df)
         m = match(r"^(genomic_coordinate|measurement)_(?!set$)(.*)", n)
@@ -414,6 +558,13 @@ is required.
 function cnv_gene_calls(; db=nothing, genes=nothing, samples=nothing, subjects=nothing,
                         measurement="cnv-call-score", kwargs...)
     require_cnv_subset(genes, samples, subjects)
+    db = ensure_db(db)
+    genes === nothing || return cnv_gene_calls_run(db, genes, samples, subjects, measurement, nothing, Int[]; kwargs...)
+    run_cnv_plan((ids, start, sets) -> cnv_gene_calls_run(db, nothing, ids, subjects, measurement, start, sets; kwargs...),
+                 measurement_attr(measurement), samples, subjects, db; kwargs...)
+end
+
+function cnv_gene_calls_run(db, genes, samples, subjects, measurement, start, sets; kwargs...)
     attr = measurement_attr(measurement)
     enum = attr in ENUM_MEASUREMENT_ATTRS
     # gene-first clause order: gene-level CNV sets are large (genes x samples)
@@ -426,9 +577,9 @@ function cnv_gene_calls(; db=nothing, genes=nothing, samples=nothing, subjects=n
     genes === nothing || (push!(ins, ["?hgnc-symbol", "..."]); push!(args, collect(genes)))
     samples === nothing || (push!(ins, ["?sample-id", "..."]); push!(args, collect(samples)))
     add_subject_filter!(where, ins, args, subjects)
-    if genes === nothing
-        where = lead_with(where, samples !== nothing ? SAMPLE_LEAD : Any[["?m", attr, enum ? "?value-ref" : "?value"]])
-    end
+    isempty(sets) || (push!(ins, ["?ms", "..."]); push!(args, sets))
+    start === :samples && (where = lead_with(where, SAMPLE_LEAD))
+    start === :sets && (where = lead_with(where, Any[["?ms", ":measurement-set/measurements", "?m"]]))
     df = runq(dq(["?sample-id", "?measurement-set", "?hgnc-symbol", "?value"], where; in=ins, args=args,
                  with=["?m"]); db=db, kwargs...)
     eltype(df.value) <: Union{Missing,AbstractString} && (df.value = ident_name.(df.value))

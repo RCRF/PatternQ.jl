@@ -212,13 +212,16 @@ Raw datoms from an index ("eavt", "aevt", "avet", "vaet"): columns e, a, v, tx;
 from `offset`, or with `after` from the cursor a previous page returned
 (offsets past 100000 need it). A server with cursor paging sets the result's
 metadata "cursor" to true and "next" to the next page's cursor (nothing at the
-end of the range).
+end of the range). `seek=true` starts at the first datom at or after
+`components` (which may run past them into the next attribute or entity); seek
+pages have no cursor.
 """
 function datoms(index::AbstractString, components=Any[]; db=nothing, offset=0, limit=1000, timeout=30,
-                after=nothing)
+                after=nothing, seek=false)
     db = ensure_db(db)
     req = Dict{String,Any}("index" => ":" * lstrip(index, ':'), "components" => components, "limit" => limit)
     after === nothing ? (req["offset"] = offset) : (req["after"] = after)
+    seek && (req["seek"] = true)
     body = JSON3.write(req)
     resp = send_api("Datoms request"; limited=true) do
         HTTP.post("$(query_server())/datoms/$(db)", headers("application/json"), body;
@@ -236,6 +239,22 @@ function datoms(index::AbstractString, components=Any[]; db=nothing, offset=0, l
     metadata!(df, "cursor", haskey(res, "next"); style=:note)
     metadata!(df, "next", get(res, "next", nothing); style=:note)
     df
+end
+
+# unify-central's stored sample index for `db`, or nothing when the service
+# doesn't answer with a current copy (no copy, a stale one, or no such route);
+# the service never builds one on request.
+function sample_index(db)
+    resp = send_api("Sample index"; limited=true) do
+        HTTP.get("$(query_server())/sample-index/$(db)", headers("application/json");
+                 status_exception=false, retry=false, request_timeout=60)
+    end
+    resp.status == 200 || return nothing
+    try
+        tonative(JSON3.read(resp.body))
+    catch
+        nothing
+    end
 end
 
 const COUNT_UNSUPPORTED = Set{String}()

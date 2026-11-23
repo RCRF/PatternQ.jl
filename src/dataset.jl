@@ -102,6 +102,91 @@ end
 # deep dive), so subject-only queries start from the measurement attribute.
 const SAMPLE_LEAD = Any[["?s", ":sample/id", "?sample-id"], ["?m", ":measurement/sample", "?s"]]
 
+# Without genes, a sample-subset call returns whole samples' worth of rows
+# (every gene's expression or CNV call): one /query per this many samples, so
+# no single query holds more on the server.
+const SAMPLES_PER_QUERY = 2
+
+function by_sample_chunks(f, samples)
+    parts = [f(collect(c)) for c in Iterators.partition(collect(samples), SAMPLES_PER_QUERY)]
+    rows = filter(p -> nrow(p) > 0, parts)
+    keep_provenance(isempty(rows) ? parts[1] : vcat(rows...; cols=:union), parts[1])
+end
+
+# The subjects' sample ids, which subject-subset calls run by.
+function subject_samples(subjects, db; kwargs...)
+    r = runq(dq(["?sample-id"], [["?p", ":subject/id", "?subject-id"], ["?s", ":sample/subject", "?p"],
+                                 ["?s", ":sample/id", "?sample-id"]];
+                in=[["?subject-id", "..."]], args=[collect(subjects)]); db=db, kwargs...)
+    nrow(r) > 0 ? sort(String.(r.sample_id)) : String[]
+end
+
+# A set's first measurement id, cached (a database name pins an immutable
+# database).
+const FIRST_MEASUREMENT = Dict{Tuple{String,Int},Union{Int,Nothing}}()
+const FIRST_MEASUREMENT_LOCK = ReentrantLock()
+function first_measurement(db, ms)
+    key = (String(db), Int(ms))
+    hit = lock(() -> get(FIRST_MEASUREMENT, key, missing), FIRST_MEASUREMENT_LOCK)
+    hit === missing || return hit
+    d = datoms("eavt", Any[ms, ":measurement-set/measurements"]; db=db, limit=1)
+    v = nrow(d) > 0 ? Int(d.v[1]) : nothing
+    lock(() -> (FIRST_MEASUREMENT[key] = v), FIRST_MEASUREMENT_LOCK)
+    v
+end
+
+# The sets in `sets` holding `attr` measurements, judged by each set's first
+# measurement (a set holds one kind of measurement): one datoms page per set
+# (cached, 4 at a time), then one query over those measurements.
+function sets_carrying(attr, sets, db)
+    firsts = asyncmap(ms -> first_measurement(db, ms), sets; ntasks=4)
+    ids = Int[f for f in firsts if f !== nothing]
+    isempty(ids) && return Int[]
+    r = runq(dq(["?m"], [["?m", attr]]; in=[["?m", "..."]], args=[ids]); db=db)
+    hit = nrow(r) > 0 ? Set(Int.(r.m)) : Set{Int}()
+    Int[ms for (ms, f) in zip(sets, firsts) if f !== nothing && f in hit]
+end
+
+const SET_WALK_CAP = 2000000  # walking more set measurements than this is never the cheaper start
+
+# How a CNV subset query should run: (:empty, []) when no `attr` set includes
+# the samples; (:sets, sets) to walk just those sets' measurements; (:samples,
+# sets) to walk the samples' measurements, restricted to those sets.
+# :measurement-set/includes-samples (schema 0.3.18) names the sets holding each
+# sample; the server counts both walks in place, and the smaller one wins. A
+# database without the enrichment walks the samples.
+function cnv_plan(attr, sample_ids, db; kwargs...)
+    has_includes_samples(db; kwargs...) || return :samples, Int[]
+    r = runq(dq(["?s", "?ms"], [["?s", ":sample/id", "?sample-id"], ["?ms", ":measurement-set/includes-samples", "?s"]];
+                in=[["?sample-id", "..."]], args=[collect(sample_ids)]); db=db, kwargs...)
+    sets = nrow(r) > 0 ? sets_carrying(attr, sort(unique(Int.(r.ms))), db) : Int[]
+    isempty(sets) && return :empty, Int[]
+    in_sets = 0
+    for ms in sets
+        n = datoms_count("eavt", Any[ms, ":measurement-set/measurements"]; db=db, cap=SET_WALK_CAP)
+        (n === nothing || !n[2]) && return :samples, sets
+        in_sets += n[1]
+    end
+    walked = 0
+    for e in sort(unique(Int.(r.s)))
+        n = datoms_count("vaet", Any[e, ":measurement/sample"]; db=db, cap=in_sets + 1)
+        walked += n === nothing ? in_sets + 1 : n[1]
+        walked > in_sets && return :sets, sets
+    end
+    :samples, sets
+end
+
+# Run a CNV subset call by plan: run(samples, start, sets) is the query.
+function run_cnv_plan(run, attr, samples, subjects, db; kwargs...)
+    ids = samples !== nothing ? collect(samples) : subject_samples(subjects, db; kwargs...)
+    isempty(ids) && return DataFrame()
+    start, sets = cnv_plan(attr, ids, db; kwargs...)
+    start === :empty && return DataFrame()
+    start === :samples && length(ids) > SAMPLES_PER_QUERY &&
+        return by_sample_chunks(c -> run(c, start, sets), ids)
+    run(ids, start, sets)
+end
+
 function lead_with(where, lead)
     vars_of(c) = Set(x for x in c if x isa AbstractString && startswith(x, "?"))
     out = Any[lead...]
@@ -151,6 +236,9 @@ measurement_set, variant_id, hgnc_symbol, HGVSp, HGVSc, impact, vaf, t_depth
 (where present). HGVSp/HGVSc (cardinality many) are joined with "; ".
 """
 function variants(; db=nothing, samples=nothing, genes=nothing, measurement_set=nothing, kwargs...)
+    if genes === nothing && samples !== nothing && length(samples) > SAMPLES_PER_QUERY
+        return by_sample_chunks(c -> variants(; db=db, samples=c, measurement_set=measurement_set, kwargs...), samples)
+    end
     df = runq(variants_query(samples=samples, genes=genes, measurement_set=measurement_set); db=db, kwargs...)
     rename_cols!(df, "variant_HGVSp" => "HGVSp", "variant_HGVSc" => "HGVSc", "variant_impact" => "impact",
                  "gene_hgnc_symbol" => "hgnc_symbol", "measurement_t_depth" => "t_depth")
@@ -188,6 +276,12 @@ Gene expression, long format: sample_id, hgnc_symbol, measurement_set, value.
 "rsem-normalized-count", ...). Datasets may have several measurement sets
 carrying the attribute (bulk, pseudobulk, ...); `measurement_set` tells them apart.
 """
-gene_expression(; db=nothing, genes=nothing, samples=nothing, measurement="tpm", measurement_set=nothing, kwargs...) =
+function gene_expression(; db=nothing, genes=nothing, samples=nothing, measurement="tpm", measurement_set=nothing,
+                         kwargs...)
+    if genes === nothing && samples !== nothing && length(samples) > SAMPLES_PER_QUERY
+        return by_sample_chunks(c -> gene_expression(; db=db, samples=c, measurement=measurement,
+                                                     measurement_set=measurement_set, kwargs...), samples)
+    end
     runq(gene_expression_query(genes=genes, samples=samples, measurement=measurement,
-                              measurement_set=measurement_set); db=db, kwargs...)
+                               measurement_set=measurement_set); db=db, kwargs...)
+end
